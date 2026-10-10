@@ -1,6 +1,4 @@
 
-from pathlib import Path
-import os
 import random
 
 import numpy as np
@@ -8,8 +6,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.metrics import average_precision_score
 from torch_geometric.nn import GCNConv
 
 from .data import (
@@ -17,7 +14,6 @@ from .data import (
     add_historical_persistence,
     build_account_mapping,
     make_edge_index,
-    build_account_features,
 )
 from .train_pipeline import (
     chronological_split,
@@ -31,7 +27,6 @@ from .train_pipeline import (
     LOOKBACK_DAYS,
 )
 
-
 SEED = 42
 HIDDEN_CHANNELS = 32
 DROPOUT = 0.2
@@ -41,15 +36,17 @@ EPOCHS = 5
 
 
 class BasicGCN(nn.Module):
-    """Standard two-layer GCN for transaction classification."""
+    """Two-layer GCN with historical persistence as a transaction feature."""
 
     def __init__(self, in_channels=6, hidden_channels=32, dropout=0.2):
         super().__init__()
         self.conv1 = GCNConv(in_channels, hidden_channels)
         self.conv2 = GCNConv(hidden_channels, hidden_channels)
         self.dropout = dropout
+
+        # Two endpoint embeddings plus one persistence feature.
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_channels * 2, hidden_channels),
+            nn.Linear(hidden_channels * 2 + 1, hidden_channels),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_channels, 2),
@@ -61,9 +58,17 @@ class BasicGCN(nn.Module):
         h = F.relu(self.conv2(h, edge_index))
         return h
 
-    def score_edges(self, h, target_edge_index):
+    def score_edges(self, h, target_edge_index, target_persistence):
         source, destination = target_edge_index
-        edge_features = torch.cat([h[source], h[destination]], dim=-1)
+
+        edge_features = torch.cat(
+            [
+                h[source],
+                h[destination],
+                target_persistence.reshape(-1, 1).to(h.dtype),
+            ],
+            dim=-1,
+        )
         return self.classifier(edge_features)
 
 
@@ -80,8 +85,14 @@ def evaluate_gcn(model, x, edge_index, targets, account_to_id, device):
 
     for start in range(0, len(targets), TARGET_BATCH_SIZE):
         batch = targets.iloc[start:start + TARGET_BATCH_SIZE]
+
         target_edges = make_edge_index(batch, account_to_id).to(device)
-        logits = model.score_edges(h, target_edges)
+        persistence = torch.as_tensor(
+            batch["persistence"].to_numpy(dtype=np.float32),
+            device=device,
+        )
+
+        logits = model.score_edges(h, target_edges, persistence)
         probs = torch.softmax(logits, dim=-1)[:, 1]
 
         probabilities.extend(probs.cpu().tolist())
@@ -98,11 +109,14 @@ def main():
 
     csv_path = get_data_path()
     output_dir = get_output_dir()
-    metrics_path = output_dir / "gcn_baseline_metrics.csv"
-    checkpoint_path = output_dir / "gcn_baseline.pt"
+    metrics_path = output_dir / "gcn_persistence_metrics.csv"
+    checkpoint_path = output_dir / "gcn_persistence.pt"
 
-    print("Baseline: standard GCN")
+    print("Baseline: GCN + historical persistence")
     print("Dataset:", csv_path)
+
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Dataset not found: {csv_path}")
 
     df = load_transactions(csv_path)
     df = add_historical_persistence(df, lookback_days=LOOKBACK_DAYS)
@@ -133,13 +147,13 @@ def main():
         weight_decay=WEIGHT_DECAY,
     )
 
-    labels = torch.tensor(
+    train_labels = torch.as_tensor(
         train_df["Is Laundering"].to_numpy(dtype=np.int64),
         dtype=torch.long,
         device=device,
     )
 
-    counts = torch.bincount(labels, minlength=2).float()
+    counts = torch.bincount(train_labels, minlength=2).float()
     class_weights = counts.sum() / (2 * counts.clamp_min(1))
 
     best_val_ap = -1.0
@@ -151,8 +165,8 @@ def main():
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
-        epoch_loss = 0.0
-        epoch_rows = 0
+        loss_sum = 0.0
+        example_count = 0
 
         for day in train_days:
             targets = train_df[train_df["day"] == day]
@@ -162,8 +176,16 @@ def main():
                 context, account_to_id, device
             )
 
-            target_edges = make_edge_index(targets, account_to_id).to(device)
-            target_labels = torch.tensor(
+            target_edges = make_edge_index(
+                targets, account_to_id
+            ).to(device)
+
+            target_persistence = torch.as_tensor(
+                targets["persistence"].to_numpy(dtype=np.float32),
+                device=device,
+            )
+
+            target_labels = torch.as_tensor(
                 targets["Is Laundering"].to_numpy(dtype=np.int64),
                 dtype=torch.long,
                 device=device,
@@ -171,10 +193,9 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
 
-            logits = model(x, edge_index, target_edges) if False else (
-                model.score_edges(
-                    model.encode_graph(x, edge_index), target_edges
-                )
+            h = model.encode_graph(x, edge_index)
+            logits = model.score_edges(
+                h, target_edges, target_persistence
             )
 
             loss = F.cross_entropy(
@@ -184,31 +205,34 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
 
-            epoch_loss += loss.item() * len(targets)
-            epoch_rows += len(targets)
+            loss_sum += loss.item() * len(targets)
+            example_count += len(targets)
 
-            del x, edge_index
+            del x, edge_index, h
 
-        # Validation uses training transactions only as context.
-        x_val, edge_val, _, _ = build_context(
+        # Validation graph context contains training transactions only.
+        x_val, edge_val, _, val_context_size = build_context(
             train_df, account_to_id, device
         )
+
         val_metrics = evaluate_gcn(
             model, x_val, edge_val, val_df, account_to_id, device
         )
 
+        val_ap = val_metrics["average_precision"]
         print(
             f"Epoch {epoch}/{EPOCHS} | "
-            f"loss={epoch_loss / max(epoch_rows, 1):.6f} | "
-            f"validation AP={val_metrics['average_precision']:.6f}"
+            f"loss={loss_sum / max(example_count, 1):.6f} | "
+            f"validation AP={val_ap:.6f} | "
+            f"context edges={val_context_size:,}"
         )
 
-        val_ap = val_metrics["average_precision"]
         if best_state is None or (
             np.isfinite(val_ap) and val_ap > best_val_ap
         ):
             if np.isfinite(val_ap):
                 best_val_ap = val_ap
+
             best_state = {
                 key: value.detach().cpu().clone()
                 for key, value in model.state_dict().items()
@@ -216,33 +240,37 @@ def main():
 
         del x_val, edge_val
 
+    if best_state is None:
+        raise RuntimeError("No model checkpoint was produced.")
+
     model.load_state_dict(best_state)
     torch.save(best_state, checkpoint_path)
 
-    # Final test context matches the proposed model's frozen snapshot.
+    # Frozen test context: training + validation transactions.
     test_context = pd.concat(
         [train_df, val_df], ignore_index=True
     ).sort_values("Timestamp")
 
-    x_test, edge_test, _, context_size = build_context(
+    x_test, edge_test, _, test_context_size = build_context(
         test_context, account_to_id, device
     )
+
     test_metrics = evaluate_gcn(
         model, x_test, edge_test, test_df, account_to_id, device
     )
 
-    print("\nGCN baseline final test metrics:")
+    print("\nGCN + persistence test metrics:")
     print(test_metrics)
 
     pd.DataFrame([{
-        "model": "GCN",
+        "model": "GCN + persistence",
         "seed": SEED,
         "best_validation_ap": best_val_ap,
         **{f"test_{key}": value for key, value in test_metrics.items()},
         "train_rows": len(train_df),
         "validation_rows": len(val_df),
         "test_rows": len(test_df),
-        "test_context_edges": context_size,
+        "test_context_edges": test_context_size,
     }]).to_csv(metrics_path, index=False)
 
     print("Saved checkpoint:", checkpoint_path)
