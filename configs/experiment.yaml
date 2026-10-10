@@ -1,0 +1,39 @@
+
+project:
+  name: historical-relational-reliability-gnn
+  seed: 42
+
+data:
+  path: HI-Small_Trans.csv
+  timestamp_column: Timestamp
+  label_column: Is Laundering
+  lookback_days: 7
+  use_full_dataset: true
+
+temporal_split:
+  train_fraction: 0.70
+  validation_fraction: 0.15
+  test_fraction: 0.15
+  chronological: true
+
+model:
+  hidden_channels: 64
+  dropout: 0.2
+  num_layers: 2
+
+training:
+  device: cpu
+  batch_size: 2048
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  epochs: 10
+  early_stopping_patience: 3
+
+evaluation:
+  primary_metric: average_precision
+  metrics:
+    - average_precision
+    - roc_auc
+    - precision
+    - recall
+    - f1
